@@ -11,12 +11,27 @@ async def refresh_route_cache():
     temp.CACHED_ROUTES = await db.get_routes(status='active')
     logger.info(f"🔄 Route Cache Refreshed. Active routes in memory: {len(temp.CACHED_ROUTES)}")
 
+async def resolve_peer_safe(client, chat_id):
+    """
+    Implements the get_chat_safe logic from the reference repo's regix.py.
+    Scans dialogs to force Pyrogram to re-cache the access hash for the peer.
+    """
+    logger.info(f"⚠️ Scanning dialogs to resolve peer: {chat_id}...")
+    async for dialog in client.get_dialogs(limit=500):
+        if dialog.chat.id == chat_id:
+            logger.info(f"✅ Successfully resolved and cached peer: {chat_id}")
+            return True
+    return False
+
 async def route_message(client, message):
     """The live listener attached to each individual client."""
     if not message.chat: return
     
     source_id = message.chat.id
     client_id = getattr(client, 'client_id', None)
+    
+    # RAW DEBUGGER
+    logger.info(f"🔎 RAW DEBUG: Client {client_id} saw a message in Chat ID: {source_id}")
     
     # Check memory cache for relevant active routes assigned to THIS client
     active_routes = [r for r in temp.CACHED_ROUTES if r['source_id'] == source_id and r['client_id'] == client_id]
@@ -48,19 +63,21 @@ async def route_message(client, message):
                 await asyncio.sleep(wait_seconds)
                 
             except PeerIdInvalid:
-                logger.warning(f"⚠️ Target {route['target_id']} not cached. Attempting to force-resolve peer...")
-                try:
-                    # Force the client to fetch and cache the chat entity
-                    await client.get_chat(route['target_id'])
-                    
-                    # Retry the copy now that it's cached
-                    await message.copy(chat_id=route['target_id'])
-                    await db.update_route_last_msg(route['route_id'], message.id)
-                    route['last_processed_msg_id'] = message.id
-                    logger.info(f"✅ Forwarded message {message.id} to Target: {route['target_id']} (After Resolving Peer)")
-                    break
-                except Exception as resolve_err:
-                    logger.error(f"❌ FATAL: Client {client_id} cannot access Target Chat {route['target_id']}. Ensure it is a member! Err: {resolve_err}")
+                # Use the reference repo's scanning method to fix the cache
+                is_resolved = await resolve_peer_safe(client, route['target_id'])
+                
+                if is_resolved:
+                    try:
+                        await message.copy(chat_id=route['target_id'])
+                        await db.update_route_last_msg(route['route_id'], message.id)
+                        route['last_processed_msg_id'] = message.id
+                        logger.info(f"✅ Forwarded message {message.id} to Target: {route['target_id']} (After Resolving Peer)")
+                        break
+                    except Exception as retry_err:
+                        logger.error(f"❌ Failed to copy after peer resolution: {retry_err}")
+                        break
+                else:
+                    logger.error(f"❌ FATAL: Target {route['target_id']} not found in client's dialogs. Ensure the client bot has been added to the target chat recently.")
                     break
                     
             except Exception as e:
@@ -115,15 +132,18 @@ async def catch_up_task():
                                 logger.warning(f"⏳ Catch-up FloodWait! Sleeping for {wait_seconds}s...")
                                 await asyncio.sleep(wait_seconds)
                             except PeerIdInvalid:
-                                try:
-                                    await worker_client.get_chat(target_id)
-                                    await msg.copy(chat_id=target_id)
-                                    await db.update_route_last_msg(route['route_id'], msg.id)
-                                    route['last_processed_msg_id'] = msg.id
-                                    await asyncio.sleep(0.5)
-                                    break
-                                except Exception:
-                                    break # If it still fails, skip the message
+                                is_resolved = await resolve_peer_safe(worker_client, target_id)
+                                if is_resolved:
+                                    try:
+                                        await msg.copy(chat_id=target_id)
+                                        await db.update_route_last_msg(route['route_id'], msg.id)
+                                        route['last_processed_msg_id'] = msg.id
+                                        await asyncio.sleep(0.5)
+                                        break
+                                    except Exception:
+                                        break 
+                                else:
+                                    break # Give up on this chunk if the target chat is completely missing
                             except Exception as e:
                                 break
                                 
