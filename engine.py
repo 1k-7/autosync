@@ -1,6 +1,8 @@
 import asyncio
 import logging
 from pyrogram.errors import FloodWait
+from pyrogram.raw.functions.channels import GetChannels
+from pyrogram.raw.types import InputChannel
 from config import temp
 from database import db
 
@@ -13,7 +15,7 @@ async def refresh_route_cache():
 
 async def resolve_peer_safe(client, chat_id):
     """
-    Implements the exact get_chat_safe logic from the reference repo's regix.py.
+    Forces Pyrogram to resolve and cache a peer, overcoming in_memory cache misses.
     """
     try:
         await client.get_chat(chat_id)
@@ -22,27 +24,39 @@ async def resolve_peer_safe(client, chat_id):
     except Exception as e:
         error_msg = str(e).lower()
         if "peer id invalid" in error_msg or "peer_id_invalid" in error_msg:
-            if not getattr(client, 'is_bot', False):
-                logger.info(f"⚠️ Peer {chat_id} not cached via get_chat. Scanning dialogs (Userbot mode)...")
+            
+            # --- FIX: MTProto Injection for Bots ---
+            if getattr(client, 'is_bot', False):
+                if str(chat_id).startswith("-100"):
+                    logger.info(f"⚠️ Bot cache miss for {chat_id}. Forcing MTProto GetChannels with access_hash=0...")
+                    try:
+                        channel_id = int(str(chat_id)[4:])
+                        # This forces Telegram to return the full Chat object, which Pyrogram auto-caches
+                        await client.invoke(GetChannels(id=[InputChannel(channel_id=channel_id, access_hash=0)]))
+                        logger.info(f"✅ Successfully force-cached channel: {chat_id} via MTProto")
+                        return True
+                    except Exception as mtproto_e:
+                        logger.error(f"❌ MTProto GetChannels failed: {mtproto_e}")
+                        return False
+                else:
+                    logger.error(f"❌ Cannot force-cache non-channel ID {chat_id} for bots.")
+                    return False
+
+            # --- FIX: Scan dialogs for Userbots ---
+            else:
+                logger.info(f"⚠️ Userbot cache miss for {chat_id}. Scanning dialogs...")
                 try:
                     async for dialog in client.get_dialogs(limit=500):
                         if dialog.chat.id == chat_id:
                             logger.info(f"✅ Successfully resolved peer: {chat_id} via dialogs")
                             return True
+                    logger.error(f"❌ Target {chat_id} not found in recent dialogs.")
                 except Exception as dialog_err:
-                    logger.error(f"Dialog scan failed: {dialog_err}")
-            else:
-                logger.error(f"❌ Target {chat_id} is inaccessible. The bot is either not a member, or lacking permissions.")
-            return False
+                    logger.error(f"❌ Dialog scan failed: {dialog_err}")
+                return False
+                
         else:
             logger.error(f"❌ get_chat failed for {chat_id}: {e}")
-            # Final Fallback for string usernames
-            if isinstance(chat_id, str):
-                try:
-                    await client.get_chat(chat_id)
-                    return True
-                except:
-                    pass
             return False
 
 async def route_message(client, message):
@@ -73,7 +87,6 @@ async def route_message(client, message):
             
         while True:
             try:
-                # Switched to explicit client invocation to prevent context mismatches
                 await client.copy_message(chat_id=route['target_id'], from_chat_id=source_id, message_id=message.id)
                 await db.update_route_last_msg(route['route_id'], message.id)
                 route['last_processed_msg_id'] = message.id
@@ -86,7 +99,6 @@ async def route_message(client, message):
                 await asyncio.sleep(wait_seconds)
                 
             except Exception as e:
-                # Catch ALL peer invalid errors (Both ValueError cache misses and Telegram API 400s)
                 error_msg = str(e).lower()
                 if "peer id invalid" in error_msg or "peer_id_invalid" in error_msg:
                     logger.warning(f"⚠️ Target {route['target_id']} not cached. Attempting to resolve...")
