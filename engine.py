@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from pyrogram.errors import FloodWait, PeerIdInvalid
+from pyrogram.errors import FloodWait
 from config import temp
 from database import db
 
@@ -16,37 +16,34 @@ async def resolve_peer_safe(client, chat_id):
     Implements the exact get_chat_safe logic from the reference repo's regix.py.
     """
     try:
-        # STEP 1: Attempt native get_chat. 
-        # This is CRITICAL for regular Bots. It fetches and caches the peer access hash.
         await client.get_chat(chat_id)
         logger.info(f"✅ Successfully resolved and cached peer: {chat_id} via get_chat")
         return True
-        
-    except PeerIdInvalid:
-        # STEP 2: Fallback for Userbots (Bots cannot use get_dialogs)
-        if not getattr(client, 'is_bot', False):
-            logger.info(f"⚠️ Peer {chat_id} not cached via get_chat. Scanning dialogs (Userbot mode)...")
-            try:
-                async for dialog in client.get_dialogs(limit=500):
-                    if dialog.chat.id == chat_id:
-                        logger.info(f"✅ Successfully resolved peer: {chat_id} via dialogs")
-                        return True
-            except Exception as e:
-                logger.error(f"Dialog scan failed: {e}")
-        else:
-            logger.error(f"❌ Target {chat_id} is inaccessible. The bot is either not a member, or lacking permissions.")
-        return False
-        
     except Exception as e:
-        logger.error(f"❌ get_chat failed for {chat_id}: {e}")
-        # Final Fallback for string usernames
-        if isinstance(chat_id, str):
-            try:
-                await client.get_chat(chat_id)
-                return True
-            except:
-                pass
-        return False
+        error_msg = str(e).lower()
+        if "peer id invalid" in error_msg or "peer_id_invalid" in error_msg:
+            if not getattr(client, 'is_bot', False):
+                logger.info(f"⚠️ Peer {chat_id} not cached via get_chat. Scanning dialogs (Userbot mode)...")
+                try:
+                    async for dialog in client.get_dialogs(limit=500):
+                        if dialog.chat.id == chat_id:
+                            logger.info(f"✅ Successfully resolved peer: {chat_id} via dialogs")
+                            return True
+                except Exception as dialog_err:
+                    logger.error(f"Dialog scan failed: {dialog_err}")
+            else:
+                logger.error(f"❌ Target {chat_id} is inaccessible. The bot is either not a member, or lacking permissions.")
+            return False
+        else:
+            logger.error(f"❌ get_chat failed for {chat_id}: {e}")
+            # Final Fallback for string usernames
+            if isinstance(chat_id, str):
+                try:
+                    await client.get_chat(chat_id)
+                    return True
+                except:
+                    pass
+            return False
 
 async def route_message(client, message):
     """The live listener attached to each individual client."""
@@ -76,7 +73,8 @@ async def route_message(client, message):
             
         while True:
             try:
-                await message.copy(chat_id=route['target_id'])
+                # Switched to explicit client invocation to prevent context mismatches
+                await client.copy_message(chat_id=route['target_id'], from_chat_id=source_id, message_id=message.id)
                 await db.update_route_last_msg(route['route_id'], message.id)
                 route['last_processed_msg_id'] = message.id
                 logger.info(f"✅ Forwarded message {message.id} to Target: {route['target_id']}")
@@ -87,28 +85,29 @@ async def route_message(client, message):
                 logger.warning(f"⏳ FloodWait hit! Sleeping for {wait_seconds}s...")
                 await asyncio.sleep(wait_seconds)
                 
-            except PeerIdInvalid:
-                # Call the robust resolver exactly like the reference repo
-                is_resolved = await resolve_peer_safe(client, route['target_id'])
-                
-                if is_resolved:
-                    try:
-                        await message.copy(chat_id=route['target_id'])
-                        await db.update_route_last_msg(route['route_id'], message.id)
-                        route['last_processed_msg_id'] = message.id
-                        logger.info(f"✅ Forwarded message {message.id} to Target: {route['target_id']} (After Resolving Peer)")
-                        break
-                    except Exception as retry_err:
-                        logger.error(f"❌ Failed to copy after peer resolution: {retry_err}")
+            except Exception as e:
+                # Catch ALL peer invalid errors (Both ValueError cache misses and Telegram API 400s)
+                error_msg = str(e).lower()
+                if "peer id invalid" in error_msg or "peer_id_invalid" in error_msg:
+                    logger.warning(f"⚠️ Target {route['target_id']} not cached. Attempting to resolve...")
+                    is_resolved = await resolve_peer_safe(client, route['target_id'])
+                    
+                    if is_resolved:
+                        try:
+                            await client.copy_message(chat_id=route['target_id'], from_chat_id=source_id, message_id=message.id)
+                            await db.update_route_last_msg(route['route_id'], message.id)
+                            route['last_processed_msg_id'] = message.id
+                            logger.info(f"✅ Forwarded message {message.id} to Target: {route['target_id']} (After Resolving Peer)")
+                            break
+                        except Exception as retry_err:
+                            logger.error(f"❌ Failed to copy after peer resolution: {retry_err}")
+                            break
+                    else:
+                        logger.error(f"❌ FATAL: Target {route['target_id']} could not be resolved.")
                         break
                 else:
-                    logger.error(f"❌ FATAL: Target {route['target_id']} could not be resolved.")
+                    logger.error(f"❌ Route {route['route_id']} failed to copy msg {message.id}: {e}")
                     break
-                    
-            except Exception as e:
-                logger.error(f"❌ Route {route['route_id']} failed to copy msg {message.id}: {e}")
-                break
-
 
 async def catch_up_task():
     """Runs on startup. Checks for missed messages while bot was offline."""
@@ -147,7 +146,7 @@ async def catch_up_task():
                             
                         while True:
                             try:
-                                await msg.copy(chat_id=target_id)
+                                await worker_client.copy_message(chat_id=target_id, from_chat_id=source_id, message_id=msg.id)
                                 await db.update_route_last_msg(route['route_id'], msg.id)
                                 route['last_processed_msg_id'] = msg.id
                                 await asyncio.sleep(0.5) 
@@ -156,21 +155,23 @@ async def catch_up_task():
                                 wait_seconds = e.value + 1
                                 logger.warning(f"⏳ Catch-up FloodWait! Sleeping for {wait_seconds}s...")
                                 await asyncio.sleep(wait_seconds)
-                            except PeerIdInvalid:
-                                is_resolved = await resolve_peer_safe(worker_client, target_id)
-                                if is_resolved:
-                                    try:
-                                        await msg.copy(chat_id=target_id)
-                                        await db.update_route_last_msg(route['route_id'], msg.id)
-                                        route['last_processed_msg_id'] = msg.id
-                                        await asyncio.sleep(0.5)
+                            except Exception as e:
+                                error_msg = str(e).lower()
+                                if "peer id invalid" in error_msg or "peer_id_invalid" in error_msg:
+                                    is_resolved = await resolve_peer_safe(worker_client, target_id)
+                                    if is_resolved:
+                                        try:
+                                            await worker_client.copy_message(chat_id=target_id, from_chat_id=source_id, message_id=msg.id)
+                                            await db.update_route_last_msg(route['route_id'], msg.id)
+                                            route['last_processed_msg_id'] = msg.id
+                                            await asyncio.sleep(0.5)
+                                            break
+                                        except Exception:
+                                            break 
+                                    else:
                                         break
-                                    except Exception:
-                                        break 
                                 else:
                                     break
-                            except Exception as e:
-                                break
                                 
             logger.info(f"✅ Route {route['route_id']} is fully synced.")
             
