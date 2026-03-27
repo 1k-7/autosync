@@ -2,7 +2,7 @@ import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from database import db
-from config import temp
+from config import Config, temp
 from client_manager import start_all_clients
 
 # --- CLIENTS MANAGEMENT ---
@@ -11,10 +11,11 @@ async def cb_clients(client, query):
     clients = await db.get_clients(query.from_user.id)
     text = "**🤖 Manage Clients**\n\n"
     for c in clients:
-        text += f"• `{c['name']}` ({c['id']}) - {'Bot' if c['is_bot'] else 'Userbot'}\n"
+        text += f"• `{c['name']}` ({c['id']}) - **{'Bot' if c['is_bot'] else 'Userbot'}**\n"
         
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Userbot Session", callback_data="client_add_userbot")],
+        [InlineKeyboardButton("➕ Add Regular Bot", callback_data="client_add_bot")],
         [InlineKeyboardButton("« Back", callback_data="menu_main")]
     ])
     await query.message.edit_text(text, reply_markup=markup)
@@ -23,6 +24,11 @@ async def cb_clients(client, query):
 async def cb_add_userbot(client, query):
     msg = await query.message.edit_text("Send your Pyrogram V2 String Session.\n\nType /cancel to abort.")
     temp.USER_STATES[query.from_user.id] = {"state": "awaiting_session", "msg_id": msg.id}
+
+@Client.on_callback_query(filters.regex("^client_add_bot$"))
+async def cb_add_bot(client, query):
+    msg = await query.message.edit_text("Send your Bot Token (from @BotFather).\n\nType /cancel to abort.")
+    temp.USER_STATES[query.from_user.id] = {"state": "awaiting_bot_token", "msg_id": msg.id}
 
 # --- CHATS MANAGEMENT ---
 @Client.on_callback_query(filters.regex("^menu_chats$"))
@@ -56,12 +62,16 @@ async def state_handler(client: Client, message: Message):
         temp.USER_STATES.pop(user_id, None)
         return await message.reply("Action cancelled. Send /start")
 
+    # Handle Userbot String Session
     if state == "awaiting_session":
         session_string = message.text
         try:
-            test_client = Client("test", session_string=session_string, in_memory=True)
+            # Test the userbot session
+            test_client = Client("test_ub", api_id=Config.API_ID, api_hash=Config.API_HASH, session_string=session_string, in_memory=True)
             await test_client.start()
             me = await test_client.get_me()
+            
+            # Save to DB (is_bot = False)
             await db.add_client(user_id, me.id, False, me.first_name, session_string, me.username)
             await test_client.stop()
             
@@ -71,7 +81,28 @@ async def state_handler(client: Client, message: Message):
             await message.reply(f"❌ Invalid session: {e}")
         finally:
             temp.USER_STATES.pop(user_id, None)
+
+    # Handle Regular Bot Token
+    elif state == "awaiting_bot_token":
+        bot_token = message.text
+        try:
+            # Test the bot token
+            test_client = Client("test_bot", api_id=Config.API_ID, api_hash=Config.API_HASH, bot_token=bot_token, in_memory=True)
+            await test_client.start()
+            me = await test_client.get_me()
             
+            # Save to DB (is_bot = True, saving token in the 'session' parameter field)
+            await db.add_client(user_id, me.id, True, me.first_name, bot_token, me.username)
+            await test_client.stop()
+            
+            await start_all_clients() # Restart engine to load new client
+            await message.reply(f"✅ Successfully added Bot: {me.first_name} (@{me.username})")
+        except Exception as e:
+            await message.reply(f"❌ Invalid Bot Token: {e}")
+        finally:
+            temp.USER_STATES.pop(user_id, None)
+            
+    # Handle Chat Registration
     elif state == "awaiting_chat_fwd":
         if not message.forward_from_chat:
             return await message.reply("❌ Please forward a message from a chat.")
