@@ -13,15 +13,40 @@ async def refresh_route_cache():
 
 async def resolve_peer_safe(client, chat_id):
     """
-    Implements the get_chat_safe logic from the reference repo's regix.py.
-    Scans dialogs to force Pyrogram to re-cache the access hash for the peer.
+    Implements the exact get_chat_safe logic from the reference repo's regix.py.
     """
-    logger.info(f"⚠️ Scanning dialogs to resolve peer: {chat_id}...")
-    async for dialog in client.get_dialogs(limit=500):
-        if dialog.chat.id == chat_id:
-            logger.info(f"✅ Successfully resolved and cached peer: {chat_id}")
-            return True
-    return False
+    try:
+        # STEP 1: Attempt native get_chat. 
+        # This is CRITICAL for regular Bots. It fetches and caches the peer access hash.
+        await client.get_chat(chat_id)
+        logger.info(f"✅ Successfully resolved and cached peer: {chat_id} via get_chat")
+        return True
+        
+    except PeerIdInvalid:
+        # STEP 2: Fallback for Userbots (Bots cannot use get_dialogs)
+        if not getattr(client, 'is_bot', False):
+            logger.info(f"⚠️ Peer {chat_id} not cached via get_chat. Scanning dialogs (Userbot mode)...")
+            try:
+                async for dialog in client.get_dialogs(limit=500):
+                    if dialog.chat.id == chat_id:
+                        logger.info(f"✅ Successfully resolved peer: {chat_id} via dialogs")
+                        return True
+            except Exception as e:
+                logger.error(f"Dialog scan failed: {e}")
+        else:
+            logger.error(f"❌ Target {chat_id} is inaccessible. The bot is either not a member, or lacking permissions.")
+        return False
+        
+    except Exception as e:
+        logger.error(f"❌ get_chat failed for {chat_id}: {e}")
+        # Final Fallback for string usernames
+        if isinstance(chat_id, str):
+            try:
+                await client.get_chat(chat_id)
+                return True
+            except:
+                pass
+        return False
 
 async def route_message(client, message):
     """The live listener attached to each individual client."""
@@ -63,7 +88,7 @@ async def route_message(client, message):
                 await asyncio.sleep(wait_seconds)
                 
             except PeerIdInvalid:
-                # Use the reference repo's scanning method to fix the cache
+                # Call the robust resolver exactly like the reference repo
                 is_resolved = await resolve_peer_safe(client, route['target_id'])
                 
                 if is_resolved:
@@ -77,7 +102,7 @@ async def route_message(client, message):
                         logger.error(f"❌ Failed to copy after peer resolution: {retry_err}")
                         break
                 else:
-                    logger.error(f"❌ FATAL: Target {route['target_id']} not found in client's dialogs. Ensure the client bot has been added to the target chat recently.")
+                    logger.error(f"❌ FATAL: Target {route['target_id']} could not be resolved.")
                     break
                     
             except Exception as e:
@@ -95,7 +120,7 @@ async def catch_up_task():
         worker_client = temp.ACTIVE_CLIENTS.get(client_id)
         if not worker_client: continue
             
-        if worker_client.is_bot: continue
+        if getattr(worker_client, 'is_bot', False): continue
             
         source_id = route['source_id']
         target_id = route['target_id']
@@ -143,7 +168,7 @@ async def catch_up_task():
                                     except Exception:
                                         break 
                                 else:
-                                    break # Give up on this chunk if the target chat is completely missing
+                                    break
                             except Exception as e:
                                 break
                                 
