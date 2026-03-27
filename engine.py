@@ -9,41 +9,51 @@ logger = logging.getLogger(__name__)
 async def refresh_route_cache():
     """Caches active routes in memory to avoid DB lookups on every single message."""
     temp.CACHED_ROUTES = await db.get_routes(status='active')
+    logger.info(f"🔄 Route Cache Refreshed. Active routes in memory: {len(temp.CACHED_ROUTES)}")
 
 async def route_message(client, message):
     """The live listener attached to each individual client."""
     if not message.chat: return
     
     source_id = message.chat.id
-    client_id = client.client_id
+    client_id = getattr(client, 'client_id', None)
+    
+    # ==========================================
+    # RAW DEBUGGER: PROVES IF THE BOT IS BLIND
+    # ==========================================
+    logger.info(f"🔎 RAW DEBUG: Client {client_id} saw a message in Chat ID: {source_id}")
+    # ==========================================
     
     # Check memory cache for relevant active routes assigned to THIS client
     active_routes = [r for r in temp.CACHED_ROUTES if r['source_id'] == source_id and r['client_id'] == client_id]
-    if not active_routes: return
+    
+    if not active_routes: 
+        return # Ignore messages in chats that aren't registered as a source
+
+    logger.info(f"📥 Message {message.id} MATCHED an active route in Source: {source_id}. Processing...")
 
     for route in active_routes:
-        # Exclusions Logic
-        if "text" in route.get('exclusions', []) and message.text: continue
-        if "video" in route.get('exclusions', []) and message.video: continue
+        if "text" in route.get('exclusions', []) and message.text: 
+            logger.info(f"⏭ Skipped message {message.id} due to 'text' exclusion.")
+            continue
+        if "video" in route.get('exclusions', []) and message.video: 
+            logger.info(f"⏭ Skipped message {message.id} due to 'video' exclusion.")
+            continue
             
-        # Infinite retry loop implementation from regix.py
         while True:
             try:
-                await client.copy_message(
-                    chat_id=route['target_id'],
-                    from_chat_id=source_id,
-                    message_id=message.id
-                )
+                await message.copy(chat_id=route['target_id'])
                 await db.update_route_last_msg(route['route_id'], message.id)
                 route['last_processed_msg_id'] = message.id
+                logger.info(f"✅ Forwarded message {message.id} to Target: {route['target_id']}")
                 break
                 
             except FloodWait as e:
                 wait_seconds = e.value + 1
-                logger.warning(f"FloodWait hit! Sleeping for {wait_seconds}s...")
+                logger.warning(f"⏳ FloodWait hit! Sleeping for {wait_seconds}s...")
                 await asyncio.sleep(wait_seconds)
             except Exception as e:
-                logger.error(f"Route {route['route_id']} failed to copy msg {message.id}: {e}")
+                logger.error(f"❌ Route {route['route_id']} failed to copy msg {message.id}: {e}")
                 break
 
 
@@ -57,15 +67,13 @@ async def catch_up_task():
         worker_client = temp.ACTIVE_CLIENTS.get(client_id)
         if not worker_client: continue
             
-        # Optimization: Regular bots cannot fetch history to catch up.
-        if worker_client.is_bot:
-            continue
+        if worker_client.is_bot: continue
             
         source_id = route['source_id']
         target_id = route['target_id']
         last_processed = route['last_processed_msg_id']
         
-        if last_processed == 0: continue # No calibration point set yet
+        if last_processed == 0: continue 
         
         try:
             actual_latest = 0
@@ -75,9 +83,8 @@ async def catch_up_task():
                 
             if actual_latest > last_processed:
                 missing_count = actual_latest - last_processed
-                logger.info(f"Route {route['route_id']} is behind by {missing_count} messages. Catching up...")
+                logger.info(f"⚡ Route {route['route_id']} is behind by {missing_count} messages. Catching up...")
                 
-                # Fetch missing messages in chunks of 200 (from regix.py optimization)
                 for k in range(last_processed + 1, actual_latest + 1, 200):
                     chunk = list(range(k, min(k + 200, actual_latest + 1)))
                     messages = await worker_client.get_messages(source_id, chunk)
@@ -85,25 +92,23 @@ async def catch_up_task():
                     for msg in messages:
                         if getattr(msg, 'empty', True): continue
                             
-                        # Infinite retry loop for catch-up phase
                         while True:
                             try:
-                                await worker_client.copy_message(target_id, source_id, msg.id)
+                                await msg.copy(chat_id=target_id)
                                 await db.update_route_last_msg(route['route_id'], msg.id)
                                 route['last_processed_msg_id'] = msg.id
-                                await asyncio.sleep(0.5) # Built-in delay
+                                await asyncio.sleep(0.5) 
                                 break
                             except FloodWait as e:
                                 wait_seconds = e.value + 1
-                                logger.warning(f"Catch-up FloodWait! Sleeping for {wait_seconds}s...")
+                                logger.warning(f"⏳ Catch-up FloodWait! Sleeping for {wait_seconds}s...")
                                 await asyncio.sleep(wait_seconds)
                             except Exception as e:
                                 break
                                 
-            logger.info(f"Route {route['route_id']} is fully synced.")
+            logger.info(f"✅ Route {route['route_id']} is fully synced.")
             
         except Exception as e:
-            logger.error(f"Catch-up failed for route {route['route_id']}: {e}")
+            logger.error(f"❌ Catch-up failed for route {route['route_id']}: {e}")
             
-    # Refresh cache after catch-up
     await refresh_route_cache()

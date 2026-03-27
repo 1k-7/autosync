@@ -14,9 +14,15 @@ async def start_all_clients():
     
     clients_data = await db.get_clients()
     for data in clients_data:
+        client_id = data['id']
+        
+        # FIX: Do not restart clients that are already running!
+        if client_id in temp.ACTIVE_CLIENTS:
+            continue 
+            
         try:
             client = Client(
-                name=str(data['id']),
+                name=str(client_id),
                 api_id=Config.API_ID,
                 api_hash=Config.API_HASH,
                 session_string=data['session'] if not data['is_bot'] else None,
@@ -24,18 +30,18 @@ async def start_all_clients():
                 in_memory=True
             )
             
-            # Attach metadata to the client object for the engine to read
-            client.client_id = data['id']
+            # Attach metadata
+            client.client_id = client_id
             client.is_bot = data['is_bot']
             
-            # Attach the live message listener directly to THIS client
-            client.add_handler(MessageHandler(route_message, filters.all & ~filters.me))
+            # Attach the live message listener (Group 1 to ensure it doesn't conflict)
+            client.add_handler(MessageHandler(route_message, filters.all), group=1)
             
             await client.start()
-            temp.ACTIVE_CLIENTS[data['id']] = client
-            logger.info(f"Started client: {data['name']} ({data['id']})")
+            temp.ACTIVE_CLIENTS[client_id] = client
+            logger.info(f"✅ Started client: {data['name']} ({client_id})")
         except Exception as e:
-            logger.error(f"Failed to start client {data['id']}: {e}")
+            logger.error(f"❌ Failed to start client {client_id}: {e}")
 
 async def stop_all_clients():
     for client_id, client in temp.ACTIVE_CLIENTS.items():
