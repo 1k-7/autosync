@@ -49,15 +49,14 @@ async def cb_route_toggle(client, query):
     new_status = 'active' if action == 'resume' else 'paused'
     
     await db.update_route_status(route_id, new_status)
-    await refresh_route_cache() # Immediately apply to engine
+    await refresh_route_cache()
     
     if new_status == 'active':
-        # Trigger catch up mechanism for this specific route
         from engine import catch_up_task
         client.loop.create_task(catch_up_task()) 
         
     await query.answer(f"Route {new_status}!", show_alert=True)
-    await cb_route_view(client, query) # Refresh view
+    await cb_route_view(client, query)
 
 @Client.on_callback_query(filters.regex("^route_delete_(.*)$"))
 async def cb_route_delete(client, query):
@@ -71,7 +70,7 @@ async def cb_route_delete(client, query):
 @Client.on_callback_query(filters.regex("^route_create_step1$"))
 async def cb_route_create_1(client, query):
     user_id = query.from_user.id
-    temp.USER_STATES[user_id] = {"new_route": {}} # Init dictionary
+    temp.USER_STATES[user_id] = {"new_route": {}}
     
     chats = await db.get_chats(user_id)
     buttons = [[InlineKeyboardButton(c['title'], callback_data=f"rcreate_source_{c['chat_id']}")] for c in chats]
@@ -117,17 +116,21 @@ async def cb_route_create_4(client, query):
     if not worker_client:
         return await query.answer("Selected client is offline.", show_alert=True)
     
-    # Get current latest message ID to start syncing from NOW
     start_msg_id = 0
-    try:
-        async for msg in worker_client.get_chat_history(source_id, limit=1):
-            start_msg_id = msg.id
-            break
-    except Exception as e:
-        return await query.message.edit_text(f"❌ Error accessing source chat with this client: {e}")
+    # FIX: Bypass history fetch if client is a regular Bot
+    if not worker_client.is_bot:
+        try:
+            async for msg in worker_client.get_chat_history(source_id, limit=1):
+                start_msg_id = msg.id
+                break
+        except Exception as e:
+            return await query.message.edit_text(f"❌ Error accessing source chat: {e}")
+    else:
+        # For Bots, we set to 0. The first live message caught will calibrate it.
+        start_msg_id = 0
         
     await db.add_route(route_id, user_id, source_id, target_id, client_id, start_msg_id)
-    await refresh_route_cache() # Update engine
+    await refresh_route_cache()
     
     temp.USER_STATES.pop(user_id, None)
     await query.answer("✅ Route Created successfully!", show_alert=True)
